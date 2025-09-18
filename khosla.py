@@ -37,12 +37,16 @@ def simulate_portfolio(
     exit_timing_mode,
     exit_years_fixed,
     seed=42,
+    initial_check_override=None,  # NEW: if provided, force initial check (ownership-driven grid)
 ):
     rng = np.random.default_rng(seed)
 
     # Capital staging
     invest_cap = fund_size * invest_pct
-    initial_check = invest_cap / (1 + reserve_ratio) / n_initial
+    if initial_check_override is not None:
+        initial_check = float(initial_check_override)
+    else:
+        initial_check = invest_cap / (1 + reserve_ratio) / n_initial
 
     # Initial ownership from post‑money valuation (PMV)
     init_own = initial_check / entry_pmv
@@ -316,113 +320,60 @@ fig_wf.add_trace(go.Bar(x=rep_df.index+1, y=rep_df['cash_back'], name='Cash Back
 fig_wf.update_layout(title='Cash Back per Deal (Representative Median Run)', xaxis_title='Deal rank', yaxis_title='Cash returned ($)', margin=dict(l=10,r=10,t=40,b=10))
 st.plotly_chart(fig_wf, use_container_width=True)
 
-# D) Sensitivity (reworked)
-# Many users expect a 2D surface that varies in both directions. Algebraically, with absolute exits and budget-driven checks,
-# PMV only affects feasibility for a *fixed ownership target*. Inside the feasible region, W_req does not change with PMV when
-# defending pro-rata. To provide informative sensitivities, allow choosing the Y-axis parameter.
+# D) Sensitivity — Ownership‑driven grid (re-coded)
+st.subheader("Sensitivity: Mean TVPI across 10 sims (Ownership‑driven grid)")
 
-sens_y = st.selectbox(
-    "Sensitivity Y-axis",
-    [
-        "Ownership (%)",
-        "Number of initial positions (n_initial)",
-        "Reserve ratio",
-    ],
-    index=1,
-)
+pmv_vals = np.linspace(10_000_000, 100_000_000, 10)  # $10MM → $100MM
+own_vals = np.linspace(0.01, 0.15, 15)               # 1% → 15%
+Z = np.full((len(own_vals), len(pmv_vals)), np.nan)
 
-pmv_vals = np.linspace(entry_pmv*0.5, entry_pmv*2.5, 25)
-Z = None
+# For this grid we *force* ownership by overriding the initial check: check = own × PMV
+# Note: This grid isolates valuation/ownership effects and does not enforce portfolio budget feasibility per cell.
 
-def required_exit_given(cost, post_own, p, L):
-    return np.where((p>0) & (post_own>0), (target_tvpi * cost / post_own - (1-p)*L) / p, np.nan)
+for i, own in enumerate(own_vals):
+    for j, pmv in enumerate(pmv_vals):
+        initial_check_override = own * pmv
+        tvpis = []
+        for k in range(10):
+            _, _, ins_k = simulate_portfolio(
+                fund_size=fund_size,
+                invest_pct=invest_pct,
+                n_initial=n_initial,
+                entry_pmv=pmv,
+                target_ownership=target_ownership,
+                reserve_ratio=reserve_ratio,
+                followon_rounds=followon_rounds,
+                per_round_dilution=per_round_dilution,
+                win_rate=win_rate,
+                loser_exit_dollars=loser_exit_dollars,
+                tail_alpha=tail_alpha,
+                winner_exit_min=winner_exit_min,
+                winner_exit_cap=(0 if winner_exit_cap == 0 else winner_exit_cap),
+                target_tvpi=target_tvpi,
+                horizon_years=horizon_years,
+                exit_timing_mode=exit_timing_mode,
+                exit_years_fixed=exit_years_fixed,
+                seed=seed + k + i*100 + j*1000,
+                initial_check_override=initial_check_override,
+            )
+            tvpis.append(ins_k['tvpi'])
+        Z[i, j] = float(np.mean(tvpis))
 
-if sens_y.startswith("Ownership"):
-    own_vals = np.linspace(max(0.02, target_ownership*0.5), min(0.30, max(0.02, target_ownership*1.5)), 25)
-    Z = np.full((len(own_vals), len(pmv_vals)), np.nan)
-    # baseline cost per deal (budget-driven)
-    initial_check_baseline = (fund_size * invest_pct) / (1 + reserve_ratio) / n_initial
-    cost_per_deal_baseline = initial_check_baseline + (initial_check_baseline * reserve_ratio if reserve_ratio > 0 else 0.0)
-
-    for i, own in enumerate(own_vals):
-        achievable_own = initial_check_baseline / pmv_vals
-        feasible = own <= achievable_own
-        post_own_row = np.where(feasible, (own if reserve_ratio>0 else own * ((1 - per_round_dilution) ** followon_rounds)), np.nan)
-        cost_row = np.full_like(pmv_vals, cost_per_deal_baseline)
-        Z[i,:] = required_exit_given(cost_row, post_own_row, win_rate, loser_exit_dollars)
-
-    y_index = np.round(own_vals*100,2)
-    y_label = 'Ownership (%)'
-
-elif sens_y.startswith("Number of initial"):
-    n_vals = np.linspace(max(5, n_initial//2), max(n_initial, 60), 25, dtype=int)
-    Z = np.full((len(n_vals), len(pmv_vals)), np.nan)
-    for i, n_i in enumerate(n_vals):
-        initial_check_row = (fund_size * invest_pct) / (1 + reserve_ratio) / n_i
-        cost_row = initial_check_row + (initial_check_row * reserve_ratio if reserve_ratio>0 else 0.0)
-        # achieved ownership varies with PMV even if you defend
-        own_row = initial_check_row / pmv_vals
-        post_own_row = own_row if reserve_ratio>0 else own_row * ((1 - per_round_dilution) ** followon_rounds)
-        Z[i,:] = required_exit_given(np.full_like(pmv_vals, cost_row), post_own_row, win_rate, loser_exit_dollars)
-    y_index = n_vals
-    y_label = 'Initial positions (n)'
-
-else:  # Reserve ratio
-    res_vals = np.linspace(0.0, 2.0, 25)
-    Z = np.full((len(res_vals), len(pmv_vals)), np.nan)
-    initial_check_baseline = (fund_size * invest_pct) / (1 + reserve_ratio) / n_initial  # note: baseline uses current reserve_ratio; below we recompute per row
-    for i, r in enumerate(res_vals):
-        initial_check_row = (fund_size * invest_pct) / (1 + r) / n_initial
-        cost_row = initial_check_row + (initial_check_row * r if r>0 else 0.0)
-        own_row = initial_check_row / pmv_vals
-        post_own_row = own_row if r>0 else own_row * ((1 - per_round_dilution) ** followon_rounds)
-        Z[i,:] = required_exit_given(np.full_like(pmv_vals, cost_row), post_own_row, win_rate, loser_exit_dollars)
-    y_index = np.round(res_vals,2)
-    y_label = 'Reserve ratio'
-
-heat_df = pd.DataFrame(Z, index=y_index, columns=np.round(pmv_vals/1e6,1))
+heat_df = pd.DataFrame(Z, index=np.round(own_vals*100,1), columns=np.round(pmv_vals/1e6,1))
 fig_heat = px.imshow(
     heat_df,
     aspect='auto',
     origin='lower',
-    labels=dict(x='Entry PMV ($MM)', y=y_label, color='Req. Winner Exit ($)'),
-    title=f'Sensitivity: Required Winner Exit $ vs Entry PMV & {y_label}',
+    labels=dict(x='Entry PMV ($MM)', y='Ownership (%)', color='Mean TVPI (×)'),
+    title='Mean Portfolio TVPI across 10 sims — Ownership-driven grid',
     zmin=np.nanpercentile(Z, 5),
     zmax=np.nanpercentile(Z, 95),
 )
-fig_heat.update_layout(margin=dict(l=10,r=10,t=40,b=10))
+
+# Invert the scale so high values map to dark colors (or vice versa)
+fig_heat.update_coloraxes(reversescale=True)
+
 st.plotly_chart(fig_heat, use_container_width=True)
 
 
-# -----------------------------
-# Table & Download (median run)
-# -----------------------------
-
-with st.expander("Show deal table (median TVPI run)"):
-    df_show = agg['median_run_df'].copy()
-    df_show['entry_pmv'] = df_show['entry_pmv'].map(fmt_money)
-    df_show['initial_check'] = df_show['initial_check'].map(fmt_money)
-    df_show['followon_spend'] = df_show['followon_spend'].map(fmt_money)
-    df_show['cost_per_deal'] = df_show['cost_per_deal'].map(fmt_money)
-    df_show['cash_back'] = df_show['cash_back'].map(fmt_money)
-    df_show['exit_value_$'] = df_show['exit_value_$'].map(fmt_money)
-    st.dataframe(df_show)
-
-csv = agg['median_run_df'].to_csv(index=False).encode('utf-8')
-st.download_button("Download deal‑level CSV (median run)", data=csv, file_name="deal_outcomes_median_run.csv", mime="text/csv")
-
-# -----------------------------
-# Narrative Insight Block
-# -----------------------------
-
-st.markdown("---")
-st.subheader("Interpretation")
-st.markdown(
-    """
-**Absolute exits** make valuation sensitivity explicit: for a fixed check budget, higher entry PMVs lower ownership,
-so even with the same exit distributions in dollars, fund TVPI/DPI fall as entry prices rise. The required winner exit
-heatmap shows how quickly expectations escalate with pmv and lower ownership.
-"""
-)
-
-st.caption("Adjust # of simulations to trade off speed vs stability. 200–500 runs usually gives a tight picture.")
+st.caption("Grid forces check = ownership × PMV for each cell (ignoring fund budget) to isolate valuation/ownership effects on mean TVPI.")
