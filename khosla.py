@@ -1,6 +1,6 @@
 # ai_valuation_fund_return_simulator.py
 # Streamlit app to stress‑test whether current AI entry valuations can plausibly return a venture fund.
-# Now supports running 50–1000 Monte Carlo simulations and averaging results.
+# Now supports Monte Carlo (50–1000 runs) and **absolute exit modeling in dollars** so entry PMV materially affects results.
 
 import math
 import numpy as np
@@ -23,14 +23,15 @@ def simulate_portfolio(
     invest_pct,
     n_initial,
     entry_pmv,
-    target_ownership,
+    target_ownership,  # kept for heatmap/sensitivity; check sizing remains budget‑driven by default
     reserve_ratio,
     followon_rounds,
     per_round_dilution,
     win_rate,
-    lose_recovery,
+    loser_exit_dollars,
     tail_alpha,
-    tail_scale,
+    winner_exit_min,
+    winner_exit_cap,
     target_tvpi,
     horizon_years,
     exit_timing_mode,
@@ -57,29 +58,34 @@ def simulate_portfolio(
     cost_per_deal = initial_check + followon_spend
     total_deployed = cost_per_deal * n_initial
 
-    # Outcomes
+    # Outcomes in ABSOLUTE DOLLARS (no MOIC-on-entry):
+    # Winners: Pareto tail on exit enterprise value in $; Losers: small $ exit/recovery
     winners = rng.binomial(1, win_rate, size=n_initial).astype(bool)
-
-    # Power‑law on company value MOIC relative to entry PMV
     U = rng.random(size=n_initial)
-    pareto_draw = tail_scale * (U ** (-1.0 / tail_alpha))
-    pareto_draw = np.clip(pareto_draw, tail_scale, 10_000)
-    company_moic = np.where(winners, pareto_draw, lose_recovery)
+    winner_exits = winner_exit_min * (U ** (-1.0 / tail_alpha))
+    if np.isfinite(winner_exit_cap) and winner_exit_cap > 0:
+        winner_exits = np.minimum(winner_exits, winner_exit_cap)
+    # ensure min bound
+    winner_exits = np.clip(winner_exits, winner_exit_min, None)
 
-    # Deal‑level MOIC to the fund
-    deal_moic = post_own * company_moic * (entry_pmv / cost_per_deal)
+    loser_exits = np.full(n_initial, loser_exit_dollars)
+    exit_values = np.where(winners, winner_exits, loser_exits)
+
+    # Deal‑level cash back and MOIC to the fund now depend on ownership and absolute exits
+    cash_back = post_own * exit_values
+    deal_moic = cash_back / cost_per_deal
 
     df = pd.DataFrame({
         'deal_id': np.arange(1, n_initial+1),
         'winner': winners,
-        'company_moic': company_moic,
+        'exit_value_$': exit_values,
         'ownership_final': post_own,
         'entry_pmv': entry_pmv,
         'initial_check': initial_check,
         'followon_spend': followon_spend,
         'cost_per_deal': cost_per_deal,
         'deal_moic': deal_moic,
-        'cash_back': deal_moic * cost_per_deal,
+        'cash_back': cash_back,
     })
 
     tvpi = df['cash_back'].sum() / total_deployed
@@ -102,11 +108,15 @@ def simulate_portfolio(
     )
     yearly['cumulative_dpi'] = yearly['distributions'].cumsum() / total_deployed
 
-    # Required winner company MOIC for target TVPI (deterministic scalar)
+    # Required **winner exit $** to hit target TVPI (deterministic algebra):
+    # TVPI = [ post_own * ( p * W_exit + (1-p) * L_exit ) ] / cost_per_deal
+    # Solve for W_exit
     p = win_rate
-    L = lose_recovery
-    scalar = post_own * (entry_pmv / cost_per_deal)
-    required_winner_company_moic = max(0.0, (target_tvpi / scalar - (1-p)*L) / p) if p > 0 else np.nan
+    L = loser_exit_dollars
+    if post_own > 0 and p > 0:
+        required_winner_exit = (target_tvpi * cost_per_deal / post_own - (1 - p) * L) / p
+    else:
+        required_winner_exit = np.nan
 
     insights = {
         'invest_capital': invest_cap,
@@ -115,7 +125,7 @@ def simulate_portfolio(
         'ownership_initial': init_own,
         'ownership_final': post_own,
         'tvpi': tvpi,
-        'required_winner_company_moic_for_target_tvpi': required_winner_company_moic,
+        'required_winner_exit_$': required_winner_exit,
     }
 
     return df, yearly, insights
@@ -124,8 +134,8 @@ def simulate_portfolio(
 @st.cache_data
 def run_simulations(n_sims, seed_base, **kwargs):
     tvpis = []
-    dpi_curves = []  # list of arrays length horizon_years
-    dfs = []  # store per‑run dfs for later inspection (kept modest size)
+    dpi_curves = []
+    dfs = []
     yearlies = []
     insights_list = []
 
@@ -140,7 +150,6 @@ def run_simulations(n_sims, seed_base, **kwargs):
     tvpis = np.array(tvpis)
     dpi_curves = np.vstack(dpi_curves)
 
-    # Aggregate stats
     tvpi_mean = float(tvpis.mean())
     tvpi_med = float(np.median(tvpis))
     tvpi_p5, tvpi_p95 = float(np.percentile(tvpis, 5)), float(np.percentile(tvpis, 95))
@@ -149,7 +158,6 @@ def run_simulations(n_sims, seed_base, **kwargs):
     dpi_p10 = np.percentile(dpi_curves, 10, axis=0)
     dpi_p90 = np.percentile(dpi_curves, 90, axis=0)
 
-    # Choose the median‑TVPI run for representative deal table/waterfall visuals
     med_idx = int(np.argsort(tvpis)[len(tvpis)//2])
 
     agg = {
@@ -173,11 +181,11 @@ def run_simulations(n_sims, seed_base, **kwargs):
 
 st.set_page_config(page_title="AI Valuation Fund‑Return Simulator", page_icon="📈", layout="wide")
 
-st.title("📈 AI Valuation Fund‑Return Simulator")
+st.title("📈 AI Valuation Fund‑Return Simulator — Absolute Exit Mode")
 st.markdown(
     """
-This simulator lets you stress‑test whether **today's entry valuations** can plausibly return a fund. Now with
-**Monte Carlo** (50–1000 runs) to average outcomes and show uncertainty bands.
+This simulator now models **absolute exit values in dollars** (not MOIC‑on‑entry). As a result, higher entry PMVs
+reduce ownership for the same check and **degrade TVPI/DPI**, matching real valuation sensitivity.
 """
 )
 
@@ -186,8 +194,8 @@ with st.sidebar:
     fund_size = st.number_input("Fund size ($)", value=200_000_000, step=10_000_000, min_value=10_000_000)
     invest_pct = st.slider("% of fund deployed into companies (after fees)", 0.5, 1.0, 0.9)
     n_initial = st.slider("Initial positions", 10, 80, 30)
-    entry_pmv = st.number_input("Typical entry post‑money valuation ($)", value=30_000_000, step=5_000_000, min_value=10_000_000)
-    target_ownership = st.number_input("Target ownership at entry (%)", value=7.0, step=0.5, min_value=1.0, max_value=25.0) / 100
+    entry_pmv = st.number_input("Typical entry post‑money valuation ($)", value=150_000_000, step=10_000_000, min_value=10_000_000)
+    target_ownership = st.number_input("Target ownership at entry (%) (for sensitivity only)", value=7.0, step=0.5, min_value=1.0, max_value=25.0) / 100
 
     st.divider()
     st.header("Reserves & Dilution")
@@ -196,11 +204,12 @@ with st.sidebar:
     per_round_dilution = st.slider("Per‑round dilution if you don’t defend (%)", 0, 40, 20) / 100
 
     st.divider()
-    st.header("Outcome Model (Power‑Law)")
+    st.header("Exit Model (absolute $)")
     win_rate = st.slider("Winner rate (%)", 1, 30, 5) / 100
-    lose_recovery = st.slider("Loser recovery (company MOIC)", 0.0, 0.5, 0.1, 0.05)
     tail_alpha = st.slider("Tail thickness α (lower = fatter tail)", 0.5, 3.0, 1.2, 0.1)
-    tail_scale = st.slider("Tail scale (min company MOIC for winners)", 2.0, 10.0, 4.0, 0.5)
+    winner_exit_min = st.number_input("Min winner exit ($)", value=300_000_000, step=50_000_000, min_value=10_000_000)
+    winner_exit_cap = st.number_input("Max winner exit cap ($, 0 = no cap)", value=100_000_000_000, step=10_000_000)
+    loser_exit_dollars = st.number_input("Loser exit / recovery ($)", value=5_000_000, step=1_000_000, min_value=0)
 
     st.divider()
     st.header("DPI vs TVPI Timing")
@@ -235,23 +244,15 @@ with st.spinner("Running Monte Carlo simulations…"):
         followon_rounds=followon_rounds,
         per_round_dilution=per_round_dilution,
         win_rate=win_rate,
-        lose_recovery=lose_recovery,
+        loser_exit_dollars=loser_exit_dollars,
         tail_alpha=tail_alpha,
-        tail_scale=tail_scale,
+        winner_exit_min=winner_exit_min,
+        winner_exit_cap=(0 if winner_exit_cap == 0 else winner_exit_cap),
         target_tvpi=target_tvpi,
         horizon_years=horizon_years,
         exit_timing_mode=exit_timing_mode,
         exit_years_fixed=exit_years_fixed,
     )
-
-# -----------------------------
-# KPIs (averaged across simulations)
-# -----------------------------
-
-# Fix: previously we tried to index the tuple returned by simulate_portfolio with a string key, causing a TypeError.
-# Updated to unpack the tuple properly and extract the insights dict.
-
-# ... (rest of the file unchanged above)
 
 # -----------------------------
 # KPIs (averaged across simulations)
@@ -263,28 +264,7 @@ col2.metric("Gross TVPI (mean)", f"{agg['tvpi_mean']:.2f}×")
 col3.metric("Gross TVPI (median)", f"{agg['tvpi_median']:.2f}×")
 col4.metric("TVPI 5–95%", f"{agg['tvpi_p5']:.2f}× – {agg['tvpi_p95']:.2f}×")
 
-# Required winner MOIC (deterministic given entry terms)
-_, _, insights_single = simulate_portfolio(
-    fund_size,
-    invest_pct,
-    n_initial,
-    entry_pmv,
-    target_ownership,
-    reserve_ratio,
-    followon_rounds,
-    per_round_dilution,
-    win_rate,
-    lose_recovery,
-    tail_alpha,
-    tail_scale,
-    target_tvpi,
-    horizon_years,
-    exit_timing_mode,
-    exit_years_fixed,
-    seed,
-)
-
-# Compute deterministic required winner MOIC once (no tuple-as-dict bug)
+# Deterministic required winner exit $
 _, _, _ins = simulate_portfolio(
     fund_size=fund_size,
     invest_pct=invest_pct,
@@ -295,27 +275,21 @@ _, _, _ins = simulate_portfolio(
     followon_rounds=followon_rounds,
     per_round_dilution=per_round_dilution,
     win_rate=win_rate,
-    lose_recovery=lose_recovery,
+    loser_exit_dollars=loser_exit_dollars,
     tail_alpha=tail_alpha,
-    tail_scale=tail_scale,
+    winner_exit_min=winner_exit_min,
+    winner_exit_cap=(0 if winner_exit_cap == 0 else winner_exit_cap),
     target_tvpi=target_tvpi,
     horizon_years=horizon_years,
     exit_timing_mode=exit_timing_mode,
     exit_years_fixed=exit_years_fixed,
     seed=seed,
 )
-_required = _ins['required_winner_company_moic_for_target_tvpi']
-scalar_note = (
-    f"To hit {target_tvpi:.1f}× TVPI at these entry terms, each *winner* would need to average "
-    f"**{_required:.1f}× company MOIC**."
-)
-st.info(scalar_note)
-
-# -----------------------------
-# Visuals
-# -----------------------------
-
-# (rest of file continues unchanged)
+req_exit = _ins['required_winner_exit_$']
+if np.isfinite(req_exit) and req_exit > 0:
+    st.info(f"To hit {target_tvpi:.1f}× TVPI with these terms, each *winner* must average **{fmt_money(req_exit)}** exit value.")
+else:
+    st.info("Insufficient ownership or winner rate is zero; cannot compute a finite required winner exit.")
 
 # -----------------------------
 # Visuals
@@ -342,40 +316,97 @@ fig_wf.add_trace(go.Bar(x=rep_df.index+1, y=rep_df['cash_back'], name='Cash Back
 fig_wf.update_layout(title='Cash Back per Deal (Representative Median Run)', xaxis_title='Deal rank', yaxis_title='Cash returned ($)', margin=dict(l=10,r=10,t=40,b=10))
 st.plotly_chart(fig_wf, use_container_width=True)
 
-# D) Sensitivity heatmap (unchanged; deterministic mapping of entry terms)
+# D) Sensitivity (reworked)
+# Many users expect a 2D surface that varies in both directions. Algebraically, with absolute exits and budget-driven checks,
+# PMV only affects feasibility for a *fixed ownership target*. Inside the feasible region, W_req does not change with PMV when
+# defending pro-rata. To provide informative sensitivities, allow choosing the Y-axis parameter.
+
+sens_y = st.selectbox(
+    "Sensitivity Y-axis",
+    [
+        "Ownership (%)",
+        "Number of initial positions (n_initial)",
+        "Reserve ratio",
+    ],
+    index=1,
+)
+
 pmv_vals = np.linspace(entry_pmv*0.5, entry_pmv*2.5, 25)
-own_vals = np.linspace(max(0.02, target_ownership*0.5), min(0.30, target_ownership*1.5), 25)
-Z = np.zeros((len(own_vals), len(pmv_vals)))
+Z = None
 
-for i, own in enumerate(own_vals):
-    initial_check_grid = own * pmv_vals
-    followon_spend_grid = np.where(reserve_ratio > 0, initial_check_grid * reserve_ratio, 0.0)
-    cost_grid = initial_check_grid + followon_spend_grid
-    scalar_grid = own * (pmv_vals / cost_grid)
-    p = win_rate
-    L = lose_recovery
-    with np.errstate(divide='ignore', invalid='ignore'):
-        Z[i, :] = np.where(p > 0, np.maximum(0.0, (target_tvpi / scalar_grid - (1-p)*L) / p), np.nan)
+def required_exit_given(cost, post_own, p, L):
+    return np.where((p>0) & (post_own>0), (target_tvpi * cost / post_own - (1-p)*L) / p, np.nan)
 
-heat_df = pd.DataFrame(Z, index=np.round(own_vals*100,2), columns=np.round(pmv_vals/1e6,1))
-fig_heat = px.imshow(heat_df, aspect='auto', origin='lower', labels=dict(x='Entry PMV ($MM)', y='Ownership (%)', color='Req. Winner Company MOIC (×)'), title='Sensitivity: Required Winner Outcomes vs Entry Terms')
+if sens_y.startswith("Ownership"):
+    own_vals = np.linspace(max(0.02, target_ownership*0.5), min(0.30, max(0.02, target_ownership*1.5)), 25)
+    Z = np.full((len(own_vals), len(pmv_vals)), np.nan)
+    # baseline cost per deal (budget-driven)
+    initial_check_baseline = (fund_size * invest_pct) / (1 + reserve_ratio) / n_initial
+    cost_per_deal_baseline = initial_check_baseline + (initial_check_baseline * reserve_ratio if reserve_ratio > 0 else 0.0)
+
+    for i, own in enumerate(own_vals):
+        achievable_own = initial_check_baseline / pmv_vals
+        feasible = own <= achievable_own
+        post_own_row = np.where(feasible, (own if reserve_ratio>0 else own * ((1 - per_round_dilution) ** followon_rounds)), np.nan)
+        cost_row = np.full_like(pmv_vals, cost_per_deal_baseline)
+        Z[i,:] = required_exit_given(cost_row, post_own_row, win_rate, loser_exit_dollars)
+
+    y_index = np.round(own_vals*100,2)
+    y_label = 'Ownership (%)'
+
+elif sens_y.startswith("Number of initial"):
+    n_vals = np.linspace(max(5, n_initial//2), max(n_initial, 60), 25, dtype=int)
+    Z = np.full((len(n_vals), len(pmv_vals)), np.nan)
+    for i, n_i in enumerate(n_vals):
+        initial_check_row = (fund_size * invest_pct) / (1 + reserve_ratio) / n_i
+        cost_row = initial_check_row + (initial_check_row * reserve_ratio if reserve_ratio>0 else 0.0)
+        # achieved ownership varies with PMV even if you defend
+        own_row = initial_check_row / pmv_vals
+        post_own_row = own_row if reserve_ratio>0 else own_row * ((1 - per_round_dilution) ** followon_rounds)
+        Z[i,:] = required_exit_given(np.full_like(pmv_vals, cost_row), post_own_row, win_rate, loser_exit_dollars)
+    y_index = n_vals
+    y_label = 'Initial positions (n)'
+
+else:  # Reserve ratio
+    res_vals = np.linspace(0.0, 2.0, 25)
+    Z = np.full((len(res_vals), len(pmv_vals)), np.nan)
+    initial_check_baseline = (fund_size * invest_pct) / (1 + reserve_ratio) / n_initial  # note: baseline uses current reserve_ratio; below we recompute per row
+    for i, r in enumerate(res_vals):
+        initial_check_row = (fund_size * invest_pct) / (1 + r) / n_initial
+        cost_row = initial_check_row + (initial_check_row * r if r>0 else 0.0)
+        own_row = initial_check_row / pmv_vals
+        post_own_row = own_row if r>0 else own_row * ((1 - per_round_dilution) ** followon_rounds)
+        Z[i,:] = required_exit_given(np.full_like(pmv_vals, cost_row), post_own_row, win_rate, loser_exit_dollars)
+    y_index = np.round(res_vals,2)
+    y_label = 'Reserve ratio'
+
+heat_df = pd.DataFrame(Z, index=y_index, columns=np.round(pmv_vals/1e6,1))
+fig_heat = px.imshow(
+    heat_df,
+    aspect='auto',
+    origin='lower',
+    labels=dict(x='Entry PMV ($MM)', y=y_label, color='Req. Winner Exit ($)'),
+    title=f'Sensitivity: Required Winner Exit $ vs Entry PMV & {y_label}',
+    zmin=np.nanpercentile(Z, 5),
+    zmax=np.nanpercentile(Z, 95),
+)
 fig_heat.update_layout(margin=dict(l=10,r=10,t=40,b=10))
 st.plotly_chart(fig_heat, use_container_width=True)
+
 
 # -----------------------------
 # Table & Download (median run)
 # -----------------------------
 
 with st.expander("Show deal table (median TVPI run)"):
-    st.dataframe(
-        agg['median_run_df'].assign(
-            entry_pmv=agg['median_run_df']['entry_pmv'].map(fmt_money),
-            initial_check=agg['median_run_df']['initial_check'].map(fmt_money),
-            followon_spend=agg['median_run_df']['followon_spend'].map(fmt_money),
-            cost_per_deal=agg['median_run_df']['cost_per_deal'].map(fmt_money),
-            cash_back=agg['median_run_df']['cash_back'].map(fmt_money),
-        )
-    )
+    df_show = agg['median_run_df'].copy()
+    df_show['entry_pmv'] = df_show['entry_pmv'].map(fmt_money)
+    df_show['initial_check'] = df_show['initial_check'].map(fmt_money)
+    df_show['followon_spend'] = df_show['followon_spend'].map(fmt_money)
+    df_show['cost_per_deal'] = df_show['cost_per_deal'].map(fmt_money)
+    df_show['cash_back'] = df_show['cash_back'].map(fmt_money)
+    df_show['exit_value_$'] = df_show['exit_value_$'].map(fmt_money)
+    st.dataframe(df_show)
 
 csv = agg['median_run_df'].to_csv(index=False).encode('utf-8')
 st.download_button("Download deal‑level CSV (median run)", data=csv, file_name="deal_outcomes_median_run.csv", mime="text/csv")
@@ -388,10 +419,10 @@ st.markdown("---")
 st.subheader("Interpretation")
 st.markdown(
     """
-**Monte Carlo view:** averaging across many draws stabilizes TVPI and DPI expectations and shows how unforgiving
-entry terms are. When entry PMVs are high and ownership is modest, the mean/median TVPI tends to sit far below
-fund targets unless winner MOICs are extreme—validating the thesis that the math breaks without outlier outcomes.
+**Absolute exits** make valuation sensitivity explicit: for a fixed check budget, higher entry PMVs lower ownership,
+so even with the same exit distributions in dollars, fund TVPI/DPI fall as entry prices rise. The required winner exit
+heatmap shows how quickly expectations escalate with pmv and lower ownership.
 """
 )
 
-st.caption("Adjust the # of simulations to trade off speed vs stability. 200–500 runs usually gives a tight picture.")
+st.caption("Adjust # of simulations to trade off speed vs stability. 200–500 runs usually gives a tight picture.")
